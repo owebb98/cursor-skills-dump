@@ -1,0 +1,83 @@
+---
+name: pr-pre-review
+description: Pre-review a GitHub pull request by marking low-value files as "Viewed" so only the files worth a human's attention are left. Marks files matching a list of extensions, plus files whose assessed importance is at or below a given level (low, med, high, critical). Use when the user invokes /pr-pre-review or asks to pre-review, triage, or mark files as viewed on a GitHub PR.
+disable-model-invocation: true
+---
+
+# PR Pre-Review
+
+Invocation: `/pr-pre-review <url>, [<extensions>], <importance>`
+
+| Arg | Required | Default |
+|-----|----------|---------|
+| `url` | Yes. Format: `https://github.com/<owner>/<repo>/pull/<number>` | none |
+| extensions | No. Identified by its `[...]` brackets | See the default list below |
+| importance | No. One of `low`, `med` (or `medium`), `high`, `critical` | `low` |
+
+The arguments are identified by their shape, not their position, so `/pr-pre-review <url>, high` works. If the URL is missing or isn't a GitHub PR URL, stop and ask for one. If a list is given, it **replaces** the defaults. `[]` means "match no extensions".
+
+### Default extensions
+
+Match each entry as a case-insensitive suffix of the file path, so whole filenames like `package-lock.json` also work.
+
+```
+.md .txt .rst
+.csproj .sln .slnx .props .targets
+package-lock.json yarn.lock pnpm-lock.yaml packages.lock.json poetry.lock Cargo.lock go.sum
+.Designer.cs .g.cs .min.js .min.css .map .snap
+.svg .png .jpg .jpeg .gif .ico .webp
+.editorconfig .gitignore .gitattributes
+```
+
+## Workflow
+
+Requires an authenticated `gh` CLI. If `gh auth status` fails, stop and tell the user. The commands below avoid inner double quotes because PowerShell strips them when it calls native executables.
+
+### 1. List the PR's files and their current viewed state
+
+```
+gh api graphql --paginate -F owner=<owner> -F name=<repo> -F number=<number> -f query='query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){id files(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{path changeType viewerViewedState}}}}}' --jq '.data.repository.pullRequest as $pr | $pr.files.nodes[] | [$pr.id, .path, .changeType, .viewerViewedState] | @tsv'
+```
+
+Each output column is: PR node ID, path, change type, viewed state. Skip files that are already `VIEWED`.
+
+### 2. Decide which files to mark
+
+- If the importance is `critical`, mark every file and skip straight to step 3.
+- Otherwise, mark every file that matches the extension list. Don't classify these files.
+- For each remaining file, rate its importance using the rubric below and mark it if the rating is **at or below** the chosen level.
+
+Get the per-file diffs for classification (the `patch` field is missing for binary or very large files):
+
+```
+gh api repos/<owner>/<repo>/pulls/<number>/files --paginate --jq '.[] | {filename, status, changes, patch}'
+```
+
+### 3. Mark the selected files as viewed
+
+Run once per file:
+
+```
+gh api graphql -F id=<pr-node-id> -F path=<path> -f query='mutation($id:ID!,$path:String!){markFileAsViewed(input:{pullRequestId:$id,path:$path}){pullRequest{id}}}'
+```
+
+To undo a mark, use the same call with `unmarkFileAsViewed`.
+
+### 4. Report
+
+Give a short summary:
+- the counts of files marked by extension, marked by importance, and left for review
+- a table of the files left unviewed, each with its rating and a one-line reason, highest rating first
+
+## Importance rubric
+
+Rate based on the **diff**, not only the path. A one-line change in an auth file can still be `low` if it only fixes a typo in a comment, and a "docs" file can be `high` if it holds an executable script.
+
+| Level | Typical changes |
+|-------|-----------------|
+| `low` | No behaviour change: formatting or whitespace only, comments, renames or moves with no content change, generated or vendored code, snapshots, deleted dead code with no remaining references |
+| `med` | Low-risk changes: tests, logging, user-facing text, simple config values, DTO or model fields, straightforward refactors with obvious equivalence |
+| `high` | Behaviour changes: business logic, data access and queries, public API or contract changes, DB migrations, dependency version bumps, CI/CD pipelines, concurrency |
+| `critical` | High blast radius: authentication and authorisation, security, crypto, secrets, payments, infrastructure and deployment, destructive data operations |
+
+When unsure between two levels, choose the **higher** one. Leaving a file unviewed is cheap. Wrongly hiding a risky file is not.
